@@ -41,12 +41,9 @@ conflicts=('hyprsunset' 'hyprsunset-git')
 # Then delete the cp line in build().
 
 build() {
-    # Override SYSTEMD_USER_UNIT_DIR to a relative path so that
-    # --prefix in package() redirects it correctly into $pkgdir.
     cmake -B "$startdir/build-pkg" \
           -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_INSTALL_PREFIX=/usr \
-          -DSYSTEMD_USER_UNIT_DIR=lib/systemd/user \
           "$startdir"
     cmake --build "$startdir/build-pkg"
 }
@@ -57,7 +54,10 @@ check() {
 }
 
 package() {
-    cmake --install "$startdir/build-pkg" --prefix "$pkgdir/usr"
+    # DESTDIR is prepended to every install destination (even absolute
+    # paths like the systemd unit dir from pkg-config), so everything
+    # lands under $pkgdir.
+    DESTDIR="$pkgdir" cmake --install "$startdir/build-pkg"
 
     install -Dm644 "$startdir/LICENSE" \
         "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
