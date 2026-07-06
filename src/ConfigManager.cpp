@@ -1,4 +1,5 @@
 #include "ConfigManager.hpp"
+#include <cmath>
 #include <cstdlib>
 #include <hyprlang.hpp>
 #include <hyprutils/path/Path.hpp>
@@ -19,6 +20,15 @@ CConfigManager::CConfigManager(std::string configPath) :
 
 void CConfigManager::init() {
     m_config.addConfigValue("max-gamma", Hyprlang::INT{100});
+
+    // solar / geolocation
+    m_config.addConfigValue("latitude", Hyprlang::FLOAT{std::nanf("")});
+    m_config.addConfigValue("longitude", Hyprlang::FLOAT{std::nanf("")});
+    m_config.addConfigValue("elevation_twilight", Hyprlang::FLOAT{-6.0f});
+    m_config.addConfigValue("elevation_daylight", Hyprlang::FLOAT{3.0f});
+    m_config.addConfigValue("transition_step", Hyprlang::INT{10});
+    m_config.addConfigValue("high_temperature", Hyprlang::INT{6500});
+    m_config.addConfigValue("low_temperature", Hyprlang::INT{4000});
 
     m_config.addSpecialCategory("profile", Hyprlang::SSpecialCategoryOptions{.key = nullptr, .anonymousKeyBased = true});
     m_config.addSpecialConfigValue("profile", "time", Hyprlang::STRING{"00:00"});
@@ -94,5 +104,61 @@ float CConfigManager::getMaxGamma() {
         return std::any_cast<Hyprlang::INT>(m_config.getConfigValue("max-gamma")) / 100.f;
     } catch (const std::bad_any_cast& e) {
         RASSERT(false, "Failed to construct max-gamma: {}", e.what()); //
+    }
+}
+
+float CConfigManager::getLatitude() {
+    try {
+        return std::any_cast<Hyprlang::FLOAT>(m_config.getConfigValue("latitude"));
+    } catch (const std::bad_any_cast&) {
+        return std::nanf("");
+    }
+}
+
+float CConfigManager::getLongitude() {
+    try {
+        return std::any_cast<Hyprlang::FLOAT>(m_config.getConfigValue("longitude"));
+    } catch (const std::bad_any_cast&) {
+        return std::nanf("");
+    }
+}
+
+float CConfigManager::getElevationTwilight() {
+    try {
+        return std::any_cast<Hyprlang::FLOAT>(m_config.getConfigValue("elevation_twilight"));
+    } catch (const std::bad_any_cast&) {
+        return -6.0f;
+    }
+}
+
+float CConfigManager::getElevationDaylight() {
+    try {
+        return std::any_cast<Hyprlang::FLOAT>(m_config.getConfigValue("elevation_daylight"));
+    } catch (const std::bad_any_cast&) {
+        return 3.0f;
+    }
+}
+
+int CConfigManager::getTransitionStep() {
+    try {
+        return std::any_cast<Hyprlang::INT>(m_config.getConfigValue("transition_step"));
+    } catch (const std::bad_any_cast&) {
+        return 10;
+    }
+}
+
+int CConfigManager::getHighTemperature() {
+    try {
+        return std::any_cast<Hyprlang::INT>(m_config.getConfigValue("high_temperature"));
+    } catch (const std::bad_any_cast&) {
+        return 6500;
+    }
+}
+
+int CConfigManager::getLowTemperature() {
+    try {
+        return std::any_cast<Hyprlang::INT>(m_config.getConfigValue("low_temperature"));
+    } catch (const std::bad_any_cast&) {
+        return 4000;
     }
 }

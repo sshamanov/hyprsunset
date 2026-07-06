@@ -11,7 +11,16 @@ class CConfigManager {
     std::vector<SSunsetProfile> getSunsetProfiles();
     float                       getMaxGamma();
 
-    void                        init();
+    // solar / geolocation config
+    float getLatitude();          // returns radians, or NAN if unset
+    float getLongitude();         // returns radians, or NAN if unset
+    float getElevationTwilight(); // degrees
+    float getElevationDaylight(); // degrees
+    int   getTransitionStep();    // kelvin per step
+    int   getHighTemperature();   // K
+    int   getLowTemperature();    // K
+
+    void  init();
 
   private:
     Hyprlang::CConfig m_config;

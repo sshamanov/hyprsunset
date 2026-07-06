@@ -1,0 +1,22 @@
+pkgbase = hyprsunset-solar
+	pkgdesc = Hyprland blue-light filter with geolocation solar tracking (fork of hyprsunset)
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://github.com/sshamanov/hyprsunset
+	arch = x86_64
+	license = BSD
+	makedepends = cmake
+	makedepends = gcc
+	makedepends = hyprland-protocols>=0.4.0
+	makedepends = hyprwayland-scanner>=0.4.0
+	makedepends = systemd
+	depends = wayland
+	depends = hyprutils>=0.2.3
+	depends = hyprlang
+	depends = wayland-protocols
+	depends = gcc-libs
+	provides = hyprsunset-solar
+	conflicts = hyprsunset
+	conflicts = hyprsunset-git
+
+pkgname = hyprsunset-solar

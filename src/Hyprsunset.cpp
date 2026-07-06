@@ -2,13 +2,16 @@
 #include "helpers/Log.hpp"
 #include "IPCSocket.hpp"
 #include <algorithm>
-#include <cstring>
-#include <mutex>
-#include <optional>
-#include <thread>
 #include <chrono>
+#include <cmath>
+#include <cstring>
+#include <ctime>
+#include <mutex>
+#include <numbers>
+#include <optional>
 #include <sys/poll.h>
 #include <sys/timerfd.h>
+#include <thread>
 #include <unistd.h>
 #include <wayland-client-core.h>
 
@@ -40,27 +43,179 @@ static void timespecAddNs(timespec* pTimespec, int64_t delta) {
     }
 }
 
-// kindly borrowed from https://tannerhelland.com/2012/09/18/convert-temperature-rgb-algorithm-code.html
-static Mat3x3 matrixForKelvin(unsigned long long temp) {
-    float r = 1.F, g = 1.F, b = 1.F;
+// ---- solar helpers (ported from wlsunset) ---------------------------------
 
-    temp /= 100;
+static time_t roundDayOffset(time_t now, time_t offset) {
+    return now - ((now - offset) % 86400);
+}
 
-    if (temp <= 66) {
-        r = 255;
-        g = std::clamp(99.4708025861 * std::log(temp) - 161.1195681661, 0.0, 255.0);
-        if (temp <= 19)
-            b = 0;
-        else
-            b = std::clamp(std::log(temp - 10) * 138.5177312231 - 305.0447927307, 0.0, 255.0);
-    } else {
-        r = std::clamp(329.698727446 * (std::pow(temp - 60, -0.1332047592)), 0.0, 255.0);
-        g = std::clamp(288.1221695283 * (std::pow(temp - 60, -0.0755148492)), 0.0, 255.0);
-        b = 255;
+static time_t tomorrow(time_t now, time_t offset) {
+    return roundDayOffset(now, offset) + 86400;
+}
+
+static double interpolatePosition(time_t now, time_t start, time_t stop) {
+    if (start == stop)
+        return (now >= stop) ? 1.0 : 0.0;
+    double pos = static_cast<double>(now - start) / static_cast<double>(stop - start);
+    return std::clamp(pos, 0.0, 1.0);
+}
+
+static constexpr double RAD_TO_DEG = 180.0 / std::numbers::pi;
+static constexpr double DEG_TO_RAD = std::numbers::pi / 180.0;
+
+// ---- solar methods ----------------------------------------------------------
+
+void CHyprsunset::recalcSolarStops(time_t now) {
+    time_t day = roundDayOffset(now, solarState.longitudeOffset);
+    if (day == solarState.calcDay)
+        return;
+
+    time_t lastDay = solarState.calcDay;
+    solarState.calcDay = day;
+
+    struct tm tm = {0};
+    gmtime_r(&day, &tm);
+
+    SolarCalculator::SolarTimes times;
+    auto                        cond = SolarCalculator::calculateSolarTimes(
+        tm, LATITUDE,
+        std::cos((90.833 - SOLAR_ELEVATION_TWILIGHT) * DEG_TO_RAD),
+        std::cos((90.833 - SOLAR_ELEVATION_DAYLIGHT) * DEG_TO_RAD),
+        times);
+
+    switch (cond) {
+    case SolarCalculator::SunCondition::Normal:
+        solarState.dawn    = times.dawn + day;
+        solarState.sunrise = times.sunrise + day;
+        solarState.sunset  = times.sunset + day;
+        solarState.night   = times.night + day;
+
+        if (solarState.condition == SolarCalculator::SunCondition::MidnightSun) {
+            solarState.dawn    = day;
+            solarState.sunrise = day;
+        }
+        break;
+
+    case SolarCalculator::SunCondition::MidnightSun:
+        if (solarState.condition == SolarCalculator::SunCondition::Normal) {
+            // borrow yesterday's dawn/sunrise offsets (today's calc
+            // returns NaN) to animate into midnight sun
+            solarState.dawn    = day + (solarState.dawn - lastDay);
+            solarState.sunrise = day + (solarState.sunrise - lastDay);
+        }
+        break;
+
+    case SolarCalculator::SunCondition::PolarNight:
+        break;
     }
 
-    return std::array<float, 9>{r / 255.F, 0, 0, 0, g / 255.F, 0, 0, 0, b / 255.F};
+    solarState.condition = cond;
+
+    int tempDiff = HIGH_KELVIN - LOW_KELVIN;
+    if (cond == SolarCalculator::SunCondition::Normal && tempDiff > 0) {
+        solarState.dawnStep  = std::max(1L, (solarState.sunrise - solarState.dawn) * SOLAR_ANIM_STEP / tempDiff);
+        solarState.nightStep = std::max(1L, (solarState.night - solarState.sunset) * SOLAR_ANIM_STEP / tempDiff);
+    }
+
+    if (cond == SolarCalculator::SunCondition::Normal) {
+        auto fmtTime = [](time_t t) -> std::string {
+            struct tm tmp;
+            localtime_r(&t, &tmp);
+            return std::format("{:02d}:{:02d}", tmp.tm_hour, tmp.tm_min);
+        };
+        Debug::log(NONE, "┣ Solar: dawn {}  sunrise {}  sunset {}  night {}",
+                   fmtTime(solarState.dawn), fmtTime(solarState.sunrise),
+                   fmtTime(solarState.sunset), fmtTime(solarState.night));
+    } else if (cond == SolarCalculator::SunCondition::MidnightSun) {
+        Debug::log(NONE, "┣ Solar: midnight sun (no sunset today)");
+    } else {
+        Debug::log(NONE, "┣ Solar: polar night (no sunrise today)");
+    }
 }
+
+double CHyprsunset::getSolarPosition(time_t now) const {
+    switch (solarState.condition) {
+    case SolarCalculator::SunCondition::Normal:
+        if (now < solarState.dawn)
+            return 0.0;
+        else if (now < solarState.sunrise)
+            return interpolatePosition(now, solarState.dawn, solarState.sunrise);
+        else if (now < solarState.sunset)
+            return 1.0;
+        else if (now < solarState.night)
+            return interpolatePosition(now, solarState.night, solarState.sunset);
+        else
+            return 0.0;
+
+    case SolarCalculator::SunCondition::MidnightSun:
+        if (now < solarState.sunrise)
+            return interpolatePosition(now, solarState.dawn, solarState.sunrise);
+        return 1.0;
+
+    case SolarCalculator::SunCondition::PolarNight:
+        return 0.0;
+    }
+    return 0.0;
+}
+
+time_t CHyprsunset::getSolarDeadline(time_t now) const {
+    switch (solarState.condition) {
+    case SolarCalculator::SunCondition::Normal:
+        if (now < solarState.dawn)
+            return solarState.dawn;
+        else if (now < solarState.sunrise)
+            return now + solarState.dawnStep;
+        else if (now < solarState.sunset)
+            return solarState.sunset;
+        else if (now < solarState.night)
+            return now + solarState.nightStep;
+        else
+            return tomorrow(now, solarState.longitudeOffset);
+
+    case SolarCalculator::SunCondition::MidnightSun:
+        if (now < solarState.sunrise)
+            return now + solarState.dawnStep;
+        return tomorrow(now, solarState.longitudeOffset);
+
+    case SolarCalculator::SunCondition::PolarNight:
+        return tomorrow(now, solarState.longitudeOffset);
+    }
+    return tomorrow(now, solarState.longitudeOffset);
+}
+
+void CHyprsunset::scheduleSolar() {
+    std::thread([&]() {
+        time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        recalcSolarStops(now);
+
+        while (!m_bTerminate) {
+            now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+            recalcSolarStops(now);
+
+            double pos        = getSolarPosition(now);
+            int    targetTemp = LOW_KELVIN + static_cast<int>((HIGH_KELVIN - LOW_KELVIN) * pos);
+
+            {
+                std::lock_guard<std::mutex> lg(m_sEventLoopInternals.loopRequestMutex);
+                if (targetTemp != static_cast<int>(KELVIN)) {
+                    KELVIN   = targetTemp;
+                    identity = false;
+                    Debug::log(TRACE, "┣ Solar: temperature → {} K (pos={:.3f})", KELVIN, pos);
+
+                    m_sEventLoopInternals.isScheduled   = true;
+                    m_sEventLoopInternals.shouldProcess = true;
+                    m_sEventLoopInternals.loopSignal.notify_all();
+                }
+            }
+
+            time_t deadline = getSolarDeadline(now);
+            auto   dlTp     = std::chrono::system_clock::from_time_t(deadline);
+            std::this_thread::sleep_until(dlTp);
+        }
+    }).detach();
+}
+
+// ---- existing methods -------------------------------------------------------
 
 void SOutput::applyCTM(struct SState* state) {
     auto arr = state->ctm.getMatrix();
@@ -89,8 +244,16 @@ int CHyprsunset::calculateMatrix() {
     else
         Debug::log(NONE, "┣ Resetting the matrix (--identity passed)\n┃", KELVIN, kelvinSet ? "" : " (default)");
 
-    // calculate the matrix
-    state.ctm = identity ? Mat3x3::identity() : matrixForKelvin(KELVIN);
+    // Use Planckian locus + Illuminant D blend (port from wlsunset)
+    if (!identity) {
+        auto wp    = SolarCalculator::calculateWhitepoint(static_cast<int>(KELVIN));
+        state.ctm  = Mat3x3{std::array<float, 9>{
+            static_cast<float>(wp.r), 0, 0,
+            0, static_cast<float>(wp.g), 0,
+            0, 0, static_cast<float>(wp.b)}};
+    } else
+        state.ctm = Mat3x3::identity();
+
     state.ctm.multiply(std::array<float, 9>{GAMMA, 0, 0, 0, GAMMA, 0, 0, 0, GAMMA});
 
     Debug::log(NONE, "┣ Calculated the CTM to be {}\n┃", state.ctm.toString());
@@ -99,7 +262,6 @@ int CHyprsunset::calculateMatrix() {
 }
 
 int CHyprsunset::init() {
-    // connect to the wayland server
     if (const auto SERVER = getenv("XDG_CURRENT_DESKTOP"); SERVER)
         Debug::log(NONE, "┣ Running on {}", SERVER);
 
@@ -166,7 +328,10 @@ int CHyprsunset::init() {
 
     state.timerFD = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC);
 
-    schedule();
+    if (solarMode)
+        scheduleSolar();
+    else
+        schedule();
     startEventLoop();
 
     return 1;
@@ -174,14 +339,8 @@ int CHyprsunset::init() {
 
 void CHyprsunset::startEventLoop() {
     pollfd pollfds[] = {
-        {
-            .fd     = wl_display_get_fd(state.wlDisplay),
-            .events = POLLIN,
-        },
-        {
-            .fd     = state.timerFD,
-            .events = POLLIN,
-        },
+        {.fd = wl_display_get_fd(state.wlDisplay), .events = POLLIN},
+        {.fd = state.timerFD, .events = POLLIN},
     };
 
     bool wlEventsPending = false;
@@ -251,7 +410,6 @@ void CHyprsunset::startEventLoop() {
     Debug::log(TRACE, "Exiting loop");
     m_bTerminate = true;
 
-    // cleanup wl resources
     state.outputs.clear();
     state.pRegistry.reset();
     state.pCTMMgr.reset();
@@ -293,6 +451,17 @@ void CHyprsunset::loadCurrentProfile() {
 
     Debug::log(NONE, "┣ Loaded {} profiles", profiles.size());
 
+    if (solarMode) {
+        time_t now  = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+        recalcSolarStops(now);
+        double pos  = getSolarPosition(now);
+        KELVIN      = LOW_KELVIN + static_cast<int>((HIGH_KELVIN - LOW_KELVIN) * pos);
+        Debug::log(NONE, "┣ Solar mode active — initial temp {} K (range {}–{} K)",
+                   KELVIN, LOW_KELVIN, HIGH_KELVIN);
+        return;
+    }
+
+    // profile mode
     std::sort(profiles.begin(), profiles.end(), [](const auto& a, const auto& b) {
         if (a.time.hour < b.time.hour)
             return true;
